@@ -47,13 +47,13 @@ import (
 
 // reconcileScheduler manages the scheduler component and its related resources
 // The scheduler handles load balancing for inference pods
-func (r *LLMISVCReconciler) reconcileScheduler(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService) error {
+func (r *LLMISVCReconciler) reconcileScheduler(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService, config *Config) error {
 	log.FromContext(ctx).Info("Reconciling Scheduler")
 
 	if err := r.reconcileSchedulerServiceAccount(ctx, llmSvc); err != nil {
 		return err
 	}
-	if err := r.reconcileSchedulerDeployment(ctx, llmSvc); err != nil {
+	if err := r.reconcileSchedulerDeployment(ctx, llmSvc, config); err != nil {
 		return err
 	}
 	if err := r.reconcileSchedulerService(ctx, llmSvc); err != nil {
@@ -147,8 +147,8 @@ func (r *LLMISVCReconciler) reconcileSchedulerServiceAccount(ctx context.Context
 	return r.reconcileSchedulerRoleBinding(ctx, llmSvc, serviceAccount)
 }
 
-func (r *LLMISVCReconciler) reconcileSchedulerDeployment(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService) error {
-	scheduler := r.expectedSchedulerDeployment(ctx, llmSvc)
+func (r *LLMISVCReconciler) reconcileSchedulerDeployment(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService, config *Config) error {
+	scheduler := r.expectedSchedulerDeployment(ctx, llmSvc, config)
 	if isStopped := utils.GetForceStopRuntime(llmSvc); isStopped || llmSvc.Spec.Router == nil || llmSvc.Spec.Router.Scheduler == nil || llmSvc.Spec.Router.Scheduler.Template == nil || llmSvc.Spec.Router.Scheduler.Pool.HasRef() {
 		if isStopped {
 			llmSvc.MarkSchedulerWorkloadNotReady("Stopped", "Service is stopped")
@@ -334,7 +334,7 @@ func (r *LLMISVCReconciler) expectedSchedulerInferencePoolV1Alpha2(ctx context.C
 	return ip
 }
 
-func (r *LLMISVCReconciler) expectedSchedulerDeployment(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService) *appsv1.Deployment {
+func (r *LLMISVCReconciler) expectedSchedulerDeployment(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService, config *Config) *appsv1.Deployment {
 	labels := SchedulerLabels(llmSvc)
 	d := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -366,9 +366,27 @@ func (r *LLMISVCReconciler) expectedSchedulerDeployment(ctx context.Context, llm
 		},
 	}
 
+	// Track whether tokenizer init container was attached
+	var tokenizerAttached bool
+
 	if llmSvc.Spec.Router != nil && llmSvc.Spec.Router.Scheduler != nil && llmSvc.Spec.Router.Scheduler.Template != nil {
 		d.Spec.Replicas = llmSvc.Spec.Router.Scheduler.Replicas
 		d.Spec.Template.Spec = *llmSvc.Spec.Router.Scheduler.Template.DeepCopy()
+
+		// Add tokenizer init for PrecisePrefixCacheScorer
+		serviceAccount, _, err := r.expectedSchedulerServiceAccount(ctx, llmSvc)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "Failed to get scheduler service account, skipping tokenizer init")
+			// Continue without tokenizer - tokenizerAttached stays false
+		} else {
+			tokenizerAttached, err = r.attachTokenizerInit(ctx, serviceAccount, llmSvc,
+				&d.Spec.Template.Spec, config)
+			if err != nil {
+				// Log error but don't fail - EPP can work without tokenizer
+				log.FromContext(ctx).Error(err, "Failed to attach tokenizer init, EPP will use default scorer")
+			}
+		}
+
 		for i := range d.Spec.Template.Spec.Containers {
 			if d.Spec.Template.Spec.Containers[i].Name != "main" {
 				continue
@@ -388,7 +406,7 @@ func (r *LLMISVCReconciler) expectedSchedulerDeployment(ctx context.Context, llm
 				!slices.Contains(d.Spec.Template.Spec.Containers[i].Args, "-config-file") {
 				d.Spec.Template.Spec.Containers[i].Args = append(d.Spec.Template.Spec.Containers[i].Args,
 					"--config-text",
-					schedulerConfigText(llmSvc),
+					schedulerConfigText(llmSvc, tokenizerAttached),
 				)
 			}
 		}
@@ -399,51 +417,52 @@ func (r *LLMISVCReconciler) expectedSchedulerDeployment(ctx context.Context, llm
 	return d
 }
 
-func schedulerConfigText(llmSvc *v1alpha2.LLMInferenceService) string {
+func schedulerConfigText(llmSvc *v1alpha2.LLMInferenceService, tokenizerAttached bool) string {
 	if llmSvc.Spec.Router != nil &&
 		llmSvc.Spec.Router.Scheduler != nil &&
 		llmSvc.Spec.Router.Scheduler.Config != nil &&
 		llmSvc.Spec.Router.Scheduler.Config.Inline != nil {
-		// We don't need to handle Ref as it's done as part of the config merge step.
+		// User config takes precedence - don't inject tokenizer config
 		return string(llmSvc.Spec.Router.Scheduler.Config.Inline.Raw)
 	}
 
 	switch {
 	case llmSvc.Spec.Prefill != nil:
-		// Always do P/D by default (threshold 0)
-		return `
+		return schedulerConfigPrefillDecode(tokenizerAttached)
+	default:
+		return schedulerConfigDefault(tokenizerAttached)
+	}
+}
+
+func schedulerConfigDefault(tokenizerAttached bool) string {
+	if tokenizerAttached {
+		// Use precise-prefix-cache-scorer with pre-fetched tokenizer
+		return fmt.Sprintf(`
 apiVersion: inference.networking.x-k8s.io/v1alpha1
 kind: EndpointPickerConfig
 plugins:
-- type: prefill-header-handler
-- type: prefill-filter
-- type: decode-filter
+- type: single-profile-handler
 - type: queue-scorer
-- type: prefix-cache-scorer
-- type: max-score-picker
-- type: pd-profile-handler
+- type: precise-prefix-cache-scorer
   parameters:
-    threshold: 0
+    indexerConfig:
+      tokenizersPoolConfig:
+        hf:
+          tokenizersCacheDir: %s
+- type: max-score-picker
 schedulingProfiles:
-- name: prefill
+- name: default
   plugins:
-  - pluginRef: prefill-filter
   - pluginRef: queue-scorer
     weight: 2
-  - pluginRef: prefix-cache-scorer
+  - pluginRef: precise-prefix-cache-scorer
     weight: 3
   - pluginRef: max-score-picker
-- name: decode
-  plugins:
-  - pluginRef: decode-filter
-  - pluginRef: queue-scorer
-    weight: 2
-  - pluginRef: prefix-cache-scorer
-    weight: 3
-  - pluginRef: max-score-picker
-`
-	default:
-		return `
+`, TokenizerMountPath)
+	}
+
+	// Original default config (no tokenizer)
+	return `
 apiVersion: inference.networking.x-k8s.io/v1alpha1
 kind: EndpointPickerConfig
 plugins:
@@ -460,7 +479,53 @@ schedulingProfiles:
     weight: 3
   - pluginRef: max-score-picker
 `
+}
+
+func schedulerConfigPrefillDecode(tokenizerAttached bool) string {
+	scorer := "prefix-cache-scorer"
+	var scorerConfig string
+
+	if tokenizerAttached {
+		scorer = "precise-prefix-cache-scorer"
+		scorerConfig = fmt.Sprintf(`
+  parameters:
+    indexerConfig:
+      tokenizersPoolConfig:
+        hf:
+          tokenizersCacheDir: %s`, TokenizerMountPath)
 	}
+
+	return fmt.Sprintf(`
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: prefill-header-handler
+- type: prefill-filter
+- type: decode-filter
+- type: queue-scorer
+- type: %s%s
+- type: max-score-picker
+- type: pd-profile-handler
+  parameters:
+    threshold: 0
+schedulingProfiles:
+- name: prefill
+  plugins:
+  - pluginRef: prefill-filter
+  - pluginRef: queue-scorer
+    weight: 2
+  - pluginRef: %s
+    weight: 3
+  - pluginRef: max-score-picker
+- name: decode
+  plugins:
+  - pluginRef: decode-filter
+  - pluginRef: queue-scorer
+    weight: 2
+  - pluginRef: %s
+    weight: 3
+  - pluginRef: max-score-picker
+`, scorer, scorerConfig, scorer, scorer)
 }
 
 func (r *LLMISVCReconciler) expectedSchedulerServiceAccount(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService) (*corev1.ServiceAccount, bool, error) {
