@@ -37,10 +37,6 @@ type Config struct {
 	IngressGatewayNamespace string `json:"ingressGatewayNamespace,omitempty"`
 	UrlScheme               string `json:"urlScheme,omitempty"`
 
-	// TokenizerFetchImage is the image for tokenizer-fetch init container.
-	// Used to pre-download tokenizers for PrecisePrefixCacheScorer in EPP.
-	TokenizerFetchImage string `json:"tokenizerFetchImage,omitempty"`
-
 	// Storage and credential configs are excluded from JSON serialization
 	// as they contain sensitive information
 	StorageConfig    *types.StorageInitializerConfig `json:"-"`
@@ -60,15 +56,11 @@ func NewConfig(ingressConfig *v1beta1.IngressConfig, storageConfig *types.Storag
 		igwName = igw[1]
 	}
 
-	// TokenizerFetchImage default - currently no configmap field exists for this image.
-	// When a configmap field is added (e.g., in StorageInitializerConfig), this default
-	// should be overridden by reading from the configmap. For now, this serves as fallback.
 	return &Config{
 		SystemNamespace:         constants.KServeNamespace,
 		IngressGatewayNamespace: igwNs,
 		IngressGatewayName:      igwName,
 		UrlScheme:               ingressConfig.UrlScheme,
-		TokenizerFetchImage:     "ghcr.io/thuanpham582002/tokenizer-fetch:latest",
 		StorageConfig:           storageConfig,
 		CredentialConfig:        credentialConfig,
 	}
